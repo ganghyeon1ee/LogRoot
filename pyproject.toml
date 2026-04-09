@@ -1,0 +1,8 @@
+[project]
+name = "shortform-ai-music-pipeline"
+version = "0.1.0"
+description = "Music ingestion and mood tagging pipeline for shortform generation"
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]

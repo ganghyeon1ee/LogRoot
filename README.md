@@ -1,56 +1,78 @@
 # shortform-ai-music-pipeline
 
-롱폼→숏폼 서비스에서 사용할 **무료 BGM 수집/태깅 파이프라인**의 AI 파트 초안입니다.
+롱폼(강연/예능/브이로그) → 숏폼 자동 생성 서비스를 위한 **AI 파이프라인 백엔드 골격**입니다.
 
-## 제공 기능
+## 구현 범위
 
-- URL 기반 음원 다운로드
-- LAION-CLAP 기반 분위기 태깅 (`top_k` 라벨 + 점수)
-- SQLite 메타데이터 저장 (추후 BE DB 이관 용이)
-- 선택적으로 S3 업로드 후 URI 저장
-- FE/BE 연동용 JSON payload 출력
+### A. 숏폼 생성 파이프라인
+1. WhisperX 기반 STT + 단어 타임스탬프
+2. 하이라이트(30~60초) 추출
+3. 자막 생성
+4. AI 음성 합성(XTTS v2)
+5. 클립 렌더링(ffmpeg)
 
-## 구조
+### B. 음원 태깅 파이프라인
+1. 무료 음원 다운로드
+2. LAION-CLAP 분위기 태깅
+3. SQLite 저장
+4. 선택적 S3 업로드
 
-- `shortform_ai/music_tagging.py`: CLAP 태거
-- `shortform_ai/downloader.py`: 음원 다운로드 및 파일 해시
-- `shortform_ai/storage.py`: SQLite 저장소 + S3 업로더
-- `shortform_ai/pipeline.py`: 전체 오케스트레이션
-- `shortform_ai/cli.py`: 실행 진입점
+---
 
-## 빠른 실행
+## 디렉터리 구조
 
+- `shortform_ai/contracts.py`: 파이프라인 공통 데이터 계약 (FE/BE 연동용)
+- `shortform_ai/shortform_pipeline.py`: 숏폼 생성 오케스트레이터
+- `shortform_ai/providers.py`: WhisperX/Groq/XTTS/ffmpeg 등 Provider 구현체
+- `shortform_ai/music_tagging.py`: CLAP 기반 분위기 태깅
+- `shortform_ai/pipeline.py`: 음원 다운로드+태깅+저장 오케스트레이터
+- `shortform_ai/storage.py`: SQLite/S3 저장소
+- `shortform_ai/cli.py`: CLI 실행 진입점
+
+---
+
+## 실행 예시
+
+### 1) 음원 수집 + 태깅
 ```bash
-python -m shortform_ai.cli "https://example.com/sample.mp3" --title "sample"
+python -m shortform_ai.cli ingest-music "https://example.com/sample.mp3" --title "sample"
 ```
 
-S3 업로드 사용 시:
-
+### 2) 숏폼 생성
 ```bash
-python -m shortform_ai.cli "https://example.com/sample.mp3" --s3-bucket your-bucket
+python -m shortform_ai.cli make-shortform /path/to/video.mp4 --output-dir outputs --num-highlights 3
 ```
 
-## BE 연동 포인트
+> 기본 하이라이터는 `RuleBasedHighlighter` 입니다. 운영에서는 `GroqHighlighter` 같은 LLM 구현체로 교체하세요.
 
-`MusicIngestionPipeline.to_api_payload(asset)` 결과를 API 응답으로 그대로 사용하면 FE에서 바로 소비 가능:
+---
 
-```json
-{
-  "source_url": "...",
-  "local_path": "downloads/foo.mp3",
-  "sha256": "...",
-  "title": "foo",
-  "tags": [
-    {"label": "peaceful music", "score": 0.43}
-  ],
-  "extra": {"s3_uri": "s3://bucket/music/..."},
-  "created_at": "2026-04-09T09:00:00.000000"
-}
-```
+## FE/BE 연동 포인트
 
-## 설치 의존성
+- `ShortformGenerationPipeline.to_api_payload()`
+- `MusicIngestionPipeline.to_api_payload()`
 
-- 필수: `torch`, `laion_clap`
-- 선택: `boto3` (S3 업로드)
+두 함수 결과를 API 응답/이벤트 payload로 바로 전달 가능하도록 dataclass 기반 JSON 구조로 맞췄습니다.
 
-> 실제 운영에서는 다운로드 소스의 라이선스 검증/중복 제거/실패 재시도/비동기 큐(Celery, SQS 등) 추가를 권장합니다.
+---
+
+## 운영 체크리스트
+
+- API 키 하드코딩 금지 (환경변수 사용)
+- 저작권/라이선스 검증 로직 추가
+- 큐 기반 비동기 처리(Celery/SQS/Kafka)
+- ffmpeg/WhisperX/TTS 실패 재시도 및 DLQ 추가
+- S3 업로드 전 중복/품질 필터링
+
+---
+
+## 의존성
+
+- 필수(기본 테스트): Python 3.10+
+- 선택(기능별):
+  - STT: `whisperx`, `torch`
+  - 하이라이트 LLM: `groq` 또는 `transformers`
+  - TTS: `TTS`, `torch`
+  - 음악 태깅: `laion_clap`, `torch`
+  - 렌더링: 시스템 `ffmpeg`
+  - 저장소: `boto3` (S3 사용 시)

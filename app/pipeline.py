@@ -138,7 +138,6 @@ def extract_highlights(transcript: TranscriptDocument, clip_count: int, min_sec:
         with httpx.Client(timeout=5.0) as client:
             r = client.post(ollama_url, json=payload)
             if r.status_code == 200 and "response" in r.json():
-                # 실패해도 서비스는 계속 가도록 best-effort 처리
                 pass
     except Exception:
         pass
@@ -156,7 +155,6 @@ def cut_video_clip(video_path: str, start_sec: float, end_sec: float, output_pat
     output.parent.mkdir(parents=True, exist_ok=True)
 
     if shutil.which("ffmpeg") is None:
-        # ffmpeg 미설치 시 원본 복사 fallback
         shutil.copy(video_path, output)
         return str(output)
 
@@ -181,7 +179,6 @@ def cut_video_clip(video_path: str, start_sec: float, end_sec: float, output_pat
     try:
         subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
-        # invalid input video 등 실패 시 원본 복사
         shutil.copy(video_path, output)
     return str(output)
 

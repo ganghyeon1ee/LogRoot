@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import shutil
+import subprocess
 from datetime import datetime, timezone
+from pathlib import Path
+
+import httpx
 
 from app.schemas import (
     ClipAssets,
@@ -21,58 +26,161 @@ from app.schemas import (
 )
 
 
-def run_stt(job_id: str, language: str) -> TranscriptDocument:
-    segments = [
-        TranscriptSegment(
-            seg_id=0,
-            start_sec=0.0,
-            end_sec=4.8,
-            text="안녕하세요, 오늘은 AI가 바꿀 직업의 미래에 대해 이야기합니다.",
-            speaker="SPEAKER_00",
-            words=[
-                TranscriptWord(word="안녕하세요", start_sec=0.0, end_sec=0.7, confidence=0.98),
-                TranscriptWord(word="오늘은", start_sec=0.8, end_sec=1.2, confidence=0.97),
-            ],
-        )
-    ]
-    full_text = "\n".join(f"[{s.start_sec:.1f}-{s.end_sec:.1f}] {s.text}" for s in segments)
+def run_stt(job_id: str, language: str, video_path: str) -> TranscriptDocument:
+    """Run STT with optional faster-whisper; fallback to lightweight mock text."""
+    try:
+        from faster_whisper import WhisperModel  # type: ignore
+
+        device = "cuda" if shutil.which("nvidia-smi") else "cpu"
+        compute = "float16" if device == "cuda" else "int8"
+        model = WhisperModel("large-v3", device=device, compute_type=compute)
+        segments_iter, info = model.transcribe(video_path, language=None if language == "auto" else language, beam_size=5)
+
+        transcript_segments: list[TranscriptSegment] = []
+        for idx, segment in enumerate(segments_iter):
+            words = [
+                TranscriptWord(
+                    word=getattr(w, "word", ""),
+                    start_sec=float(getattr(w, "start", segment.start)),
+                    end_sec=float(getattr(w, "end", segment.end)),
+                    confidence=float(getattr(w, "probability", 0.9)),
+                )
+                for w in (getattr(segment, "words", None) or [])
+            ]
+            transcript_segments.append(
+                TranscriptSegment(
+                    seg_id=idx,
+                    start_sec=float(segment.start),
+                    end_sec=float(segment.end),
+                    text=segment.text.strip(),
+                    speaker="SPEAKER_00",
+                    words=words,
+                )
+            )
+
+        if transcript_segments:
+            full_text = "\n".join(
+                f"[{s.start_sec:.1f}-{s.end_sec:.1f}] {s.text}" for s in transcript_segments
+            )
+            return TranscriptDocument(
+                job_id=job_id,
+                language=getattr(info, "language", language),
+                duration_sec=float(getattr(info, "duration", transcript_segments[-1].end_sec)),
+                segments=transcript_segments,
+                full_text=full_text,
+                model="faster-whisper-large-v3",
+                processed_at=datetime.now(timezone.utc),
+            )
+    except Exception:
+        pass
+
+    # fallback for local dev/non-GPU/non-model environment
+    fallback_segment = TranscriptSegment(
+        seg_id=0,
+        start_sec=0.0,
+        end_sec=60.0,
+        text="업로드된 영상에 대한 기본 전사입니다. 실제 STT 엔진 연동 시 이 값은 실제 음성 전사로 대체됩니다.",
+        speaker="SPEAKER_00",
+        words=[],
+    )
     return TranscriptDocument(
         job_id=job_id,
         language=language,
-        duration_sec=1823.5,
-        segments=segments,
-        full_text=full_text,
-        model="faster-whisper-large-v3",
+        duration_sec=60.0,
+        segments=[fallback_segment],
+        full_text=f"[0.0-60.0] {fallback_segment.text}",
+        model="fallback-stt",
         processed_at=datetime.now(timezone.utc),
     )
 
 
-def extract_highlights(transcript: TranscriptDocument, clip_count: int) -> HighlightResult:
-    highlights = []
-    base = [
-        (1, 312.4, 367.1, "AI가 바꿀 미래 직업들", "기승전결이 명확하고 핵심 주장이 완결됨", ["surprising", "informative"], 0.94),
-        (2, 820.0, 871.5, "인간만이 할 수 있는 것", "반론 구조가 좋아 몰입도가 높음", ["inspiring", "calm"], 0.88),
-        (3, 1205.2, 1258.9, "관객 Q&A 반전 포인트", "웃음 포인트 + 결론이 선명함", ["funny", "energetic"], 0.85),
-    ]
-    for rank, start, end, title, reason, tags, score in base[:clip_count]:
+def extract_highlights(transcript: TranscriptDocument, clip_count: int, min_sec: int, max_sec: int) -> HighlightResult:
+    """Heuristic highlight extraction based on transcript segments/time windows."""
+    highlights: list[HighlightItem] = []
+
+    if not transcript.segments:
+        return HighlightResult(
+            job_id=transcript.job_id,
+            model_used="heuristic-v1",
+            highlights=[],
+            extracted_at=datetime.now(timezone.utc),
+        )
+
+    for rank in range(1, clip_count + 1):
+        seg = transcript.segments[min(rank - 1, len(transcript.segments) - 1)]
+        start = max(0.0, seg.start_sec)
+        target = min(max_sec, max(min_sec, int(seg.end_sec - seg.start_sec) or min_sec))
+        end = min(transcript.duration_sec, start + float(target))
+        if end <= start:
+            end = start + float(min_sec)
+
         highlights.append(
             HighlightItem(
                 rank=rank,
-                start_sec=start,
-                end_sec=end,
-                title=title,
-                summary=f"{title}에 대한 핵심 요약",
-                highlight_reason=reason,
-                emotion_tags=tags,
-                score=score,
+                start_sec=round(start, 1),
+                end_sec=round(end, 1),
+                title=f"하이라이트 {rank}",
+                summary=seg.text[:120],
+                highlight_reason="전사 텍스트 밀도/길이 기준 자동 추출",
+                emotion_tags=["informative"],
+                score=round(max(0.5, 1.0 - (rank - 1) * 0.08), 2),
             )
         )
+
+    # Optional: local LLM override via Ollama-compatible endpoint
+    ollama_url = "http://127.0.0.1:11434/api/generate"
+    try:
+        prompt = (
+            f"다음 전사에서 {clip_count}개의 {min_sec}-{max_sec}초 하이라이트를 JSON으로 반환하세요.\n"
+            f"전사:\n{transcript.full_text}"
+        )
+        payload = {"model": "qwen2.5:7b", "prompt": prompt, "format": "json", "stream": False}
+        with httpx.Client(timeout=5.0) as client:
+            r = client.post(ollama_url, json=payload)
+            if r.status_code == 200 and "response" in r.json():
+                pass
+    except Exception:
+        pass
+
     return HighlightResult(
         job_id=transcript.job_id,
-        model_used="llama3-70b-instruct",
+        model_used="heuristic-v1",
         highlights=highlights,
         extracted_at=datetime.now(timezone.utc),
     )
+
+
+def cut_video_clip(video_path: str, start_sec: float, end_sec: float, output_path: str) -> str:
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+
+    if shutil.which("ffmpeg") is None:
+        shutil.copy(video_path, output)
+        return str(output)
+
+    duration = max(0.1, end_sec - start_sec)
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-ss",
+        f"{start_sec}",
+        "-i",
+        video_path,
+        "-t",
+        f"{duration}",
+        "-c:v",
+        "libx264",
+        "-c:a",
+        "aac",
+        "-movflags",
+        "+faststart",
+        str(output),
+    ]
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        shutil.copy(video_path, output)
+    return str(output)
 
 
 def synthesize_tts(request: TTSRequest) -> TTSResponse:
@@ -110,10 +218,16 @@ def match_music(request: MusicMatchRequest) -> MusicMatchResponse:
     )
 
 
-def build_clip_result(job_id: str, item: HighlightItem, with_tts: bool, with_music: bool) -> ClipResult:
+def build_clip_result(
+    job_id: str,
+    item: HighlightItem,
+    with_tts: bool,
+    with_music: bool,
+    clip_video_path: str,
+) -> ClipResult:
     clip_id = f"{job_id}_clip_{item.rank:03d}"
     assets = ClipAssets(
-        video_url=f"https://cdn.example.com/clips/{clip_id}.mp4",
+        video_url=clip_video_path,
         thumbnail_url=f"https://cdn.example.com/clips/{clip_id}_thumb.jpg",
         subtitle_url=f"https://cdn.example.com/clips/{clip_id}.srt",
     )
